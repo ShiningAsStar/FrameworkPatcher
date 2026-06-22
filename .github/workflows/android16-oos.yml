@@ -1,19 +1,20 @@
 name: Android 16 Framework Patcher for OxygenOS 16
 
+
 on:
   workflow_dispatch:
     inputs:
       api_level:
-        description: 'Android API level (Android 16 is API 36)'
+        description: 'Android API level'
         required: true
         default: '36'
         type: string
       device_codename:
-        description: 'Device codename (for zip file naming, e.g., "munch"). Optional, will use sanitized device_name if not provided.'
+        description: 'Device codename'
         required: false
         type: string
       device_name:
-        description: 'Full device name (for release description, e.g., "OnePlus 12")'
+        description: 'Full device name'
         required: true
         type: string
       version_name:
@@ -21,23 +22,23 @@ on:
         required: true
         type: string
       framework_url:
-        description: 'URL to framework.jar (required for: signature_verification, kaorios_toolbox)'
+        description: 'URL to framework.jar'
         required: false
         type: string
       services_url:
-        description: 'URL to services.jar (required for: signature_verification, disable_secure_flag)'
+        description: 'URL to services.jar'
         required: false
         type: string
       oplus_services_url:
-        description: 'URL to oplus-services.jar (required for: signature_verification, disable_secure_flag)'
+        description: 'URL to oplus-services.jar'
         required: false
         type: string
       user_id:
-        description: 'Telegram User ID to notify (optional)'
+        description: 'Telegram User ID to notify'
         required: false
         type: string
       features:
-        description: 'Comma-separated list of features to enable (e.g., "disable_signature_verification,disable_secure_flag")'
+        description: 'Features to enable'
         required: false
         type: string
         default: 'disable_signature_verification'
@@ -182,6 +183,11 @@ jobs:
           : > "$LOG_FILE"
           exec > >(tee -a "$LOG_FILE") 2>&1
           set -o pipefail
+
+          find scripts/ -type f -exec sed -i 's/miui-services/oplus-services/g' {} +
+          find scripts/ -type f -exec sed -i 's/miui_services/oplus_services/g' {} +
+          find scripts/ -type f -exec sed -i 's/miui/oplus/g' {} +
+          find scripts/ -type f -exec sed -i 's/MIUI/Oplus/g' {} +
 
           chmod +x scripts/patcher_a16.sh
           
