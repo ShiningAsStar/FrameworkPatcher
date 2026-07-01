@@ -1,0 +1,453 @@
+name: Android 16 Framework Patcher for FlymeAIOS 12.6
+
+on:
+  workflow_dispatch:
+    inputs:
+      api_level:
+        description: 'Android API level'
+        required: true
+        default: '36'
+        type: string
+      device_codename:
+        description: 'Device codename'
+        required: false
+        type: string
+      device_name:
+        description: 'Full device name'
+        required: true
+        type: string
+      version_name:
+        description: 'ROM/firmware version identifier'
+        required: true
+        type: string
+      framework_url:
+        description: 'URL to framework.jar'
+        required: false
+        type: string
+      services_url:
+        description: 'URL to services.jar'
+        required: false
+        type: string
+      user_id:
+        description: 'Telegram User ID to notify'
+        required: false
+        type: string
+      features:
+        description: 'Features to enable'
+        required: false
+        type: string
+        default: 'disable_signature_verification'
+
+jobs:
+  patch:
+    name: Android 16 Framework Patcher
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y p7zip-full wget zip python3 python3-pip
+          pip3 install gdown
+
+      - name: Prepare tools directory
+        run: |
+          mkdir -p tools
+          APKTOOL_URL=$(python3 -c "import json; print(json.load(open('tools/versions.lock'))['apktool']['url'])")
+          APKTOOL_SHA=$(python3 -c "import json; print(json.load(open('tools/versions.lock'))['apktool']['sha256'])")
+          if [ ! -f tools/apktool.jar ]; then
+            wget -q -O tools/apktool.jar "$APKTOOL_URL"
+          fi
+          ACTUAL_SHA=$(sha256sum tools/apktool.jar | cut -d' ' -f1)
+          if [ "$ACTUAL_SHA" != "$APKTOOL_SHA" ]; then
+            echo "❌ apktool.jar SHA256 mismatch!"
+            exit 1
+          fi
+          echo "✅ apktool.jar verified"
+
+      - name: Download framework JARs
+        run: |
+          download_file() {
+            url=$1
+            output=$2
+            echo "Downloading $output from $url"
+            
+            if echo "$url" | grep -q "drive.google.com"; then
+              echo "Detected Google Drive link, using gdown..."
+              file_id=$(echo "$url" | sed -n 's|.*\/d\/\([^\/?]*\).*|\1|p')
+              if [ -n "$file_id" ]; then
+                echo "Using file ID fallback for Google Drive link..."
+                gdown -O "$output" "$file_id"
+              else
+                echo "Could not extract file ID, trying URL directly..."
+                gdown -O "$output" "$url"
+              fi
+            else
+              echo "Using wget for download..."
+              wget -O "$output" "$url"
+            fi
+          }
+          
+          FEATURES="${{ github.event.inputs.features }}"
+          NEED_FRAMEWORK=0
+          NEED_SERVICES=0
+          
+          if [[ "$FEATURES" == *"disable_signature_verification"* ]]; then
+            NEED_FRAMEWORK=1
+            NEED_SERVICES=1
+          fi
+          
+          if [[ "$FEATURES" == *"kaorios_toolbox"* ]]; then
+            NEED_FRAMEWORK=1
+          fi
+          
+          if [[ "$FEATURES" == *"disable_secure_flag"* ]]; then
+            NEED_SERVICES=1
+          fi
+          
+          echo "============================================"
+          echo "Feature-based JAR requirements:"
+          echo "  framework.jar: $([ $NEED_FRAMEWORK -eq 1 ] && echo 'REQUIRED' || echo 'not needed')"
+          echo "  services.jar: $([ $NEED_SERVICES -eq 1 ] && echo 'REQUIRED' || echo 'not needed')"
+          echo "============================================"
+          
+          if [ $NEED_FRAMEWORK -eq 1 ]; then
+            if [ -z "${{ github.event.inputs.framework_url }}" ]; then
+              echo "❌ framework.jar URL is required but not provided!"
+              exit 1
+            fi
+            download_file "${{ github.event.inputs.framework_url }}" "framework.jar"
+          fi
+          
+          if [ $NEED_SERVICES -eq 1 ]; then
+            if [ -z "${{ github.event.inputs.services_url }}" ]; then
+              echo "❌ services.jar URL is required but not provided!"
+              exit 1
+            fi
+            download_file "${{ github.event.inputs.services_url }}" "services.jar"
+          fi
+          
+          echo "Validating downloaded JAR files..."
+          for jar in framework.jar services.jar; do
+            if [ -f "$jar" ]; then
+              file_size=$(stat -c%s "$jar")
+              echo "Checking $jar (${file_size} bytes)..."
+              
+              if [ $file_size -lt 1500000 ]; then
+                echo "❌ Error: $jar is too small (${file_size} bytes). Download might have failed."
+                exit 1
+              fi
+              
+              echo "✅ $jar validated successfully"
+            fi
+          done
+          
+          echo "All required JAR files downloaded and validated!"
+
+      - name: Set safe device codename
+        id: set_codename
+        run: |
+          RAW_CODENAME="${{ github.event.inputs.device_codename }}"
+          if [ -z "$RAW_CODENAME" ]; then
+            RAW_CODENAME="${{ github.event.inputs.device_name }}"
+          fi
+          SAFE_CODENAME=$(echo "$RAW_CODENAME" | sed 's/[^a-zA-Z0-9._-]/_/g')
+          echo "codename=${SAFE_CODENAME}" >> $GITHUB_OUTPUT
+
+      - name: Run Android 16 patcher
+        run: |
+          LOG_FILE="build_log_android16.txt"
+          : > "$LOG_FILE"
+          exec > >(tee -a "$LOG_FILE") 2>&1
+          set -o pipefail
+
+          chmod +x scripts/patcher_a16.sh
+          
+          FEATURE_FLAGS=""
+          if [[ "${{ github.event.inputs.features }}" == *disable_signature_verification* ]]; then
+            FEATURE_FLAGS="$FEATURE_FLAGS --disable-signature-verification"
+          fi
+          if [[ "${{ github.event.inputs.features }}" == *disable_secure_flag* ]]; then
+            FEATURE_FLAGS="$FEATURE_FLAGS --disable-secure-flag"
+          fi
+          if [[ "${{ github.event.inputs.features }}" == *kaorios_toolbox* ]]; then
+            FEATURE_FLAGS="$FEATURE_FLAGS --kaorios-toolbox"
+          fi
+          
+          if [ -z "$FEATURE_FLAGS" ]; then
+            FEATURE_FLAGS="--disable-signature-verification"
+          fi
+          
+          JAR_FLAGS=""
+          if [ -f "framework.jar" ]; then
+            JAR_FLAGS="$JAR_FLAGS --framework"
+          fi
+          if [ -f "services.jar" ]; then
+            JAR_FLAGS="$JAR_FLAGS --services"
+          fi
+          
+          echo "Running patcher with JAR flags: $JAR_FLAGS"
+          echo "Feature flags: $FEATURE_FLAGS"
+          
+          export WORKFLOW_RUN_ID="${{ github.run_id }}"
+          export WORKFLOW_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          export WORKFLOW_RELEASE_URL="https://github.com/${{ github.repository }}/releases/tag/build-tmp-${{ github.run_id }}"
+
+          ./scripts/patcher_a16.sh \
+            "${{ github.event.inputs.api_level }}" \
+            "${{ steps.set_codename.outputs.codename }}" \
+            "${{ github.event.inputs.version_name }}" \
+            $JAR_FLAGS $FEATURE_FLAGS
+
+      - name: Verify module creation
+        run: |
+          echo "Checking if module was created properly..."
+          MODULE_FILE=$(ls Framework-Patcher-${{ steps.set_codename.outputs.codename }}*.zip 2>/dev/null || echo "")
+          if [ -z "$MODULE_FILE" ]; then
+            echo "❌ No module ZIP found!"
+            exit 1
+          fi
+          echo "✅ Module ZIP found: $MODULE_FILE"
+          echo "Module contents:"
+          unzip -l "$MODULE_FILE" | head -20
+          echo "Checking for MMT-Extended files:"
+          unzip -l "$MODULE_FILE" | grep -E "(module\.prop|customize\.sh|common/functions\.sh|META-INF)" || echo "❌ Missing MMT-Extended files"
+
+      - name: Set Release Info
+        id: release_info
+        run: |
+          RELEASE_TAG="build-tmp-${{ github.run_id }}"
+          RELEASE_NAME="Android 16 | ${{ steps.set_codename.outputs.codename }} | ${{ github.event.inputs.version_name }}"
+          echo "tag=${RELEASE_TAG}" >> $GITHUB_OUTPUT
+          echo "name=${RELEASE_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Find Module ZIP
+        id: find_zip
+        run: |
+          ZIP_FILE=$(ls Framework-Patcher-${{ steps.set_codename.outputs.codename }}*.zip 2>/dev/null || echo "")
+          if [ -z "$ZIP_FILE" ]; then
+            echo "No module ZIP found!"
+            exit 1
+          fi
+          echo "file_path=${ZIP_FILE}" >> $GITHUB_OUTPUT
+
+      - name: Delete Existing Release
+        uses: actions/github-script@v6
+        continue-on-error: true
+        with:
+          script: |
+            try {
+              const releases = await github.rest.repos.listReleases({
+                owner: context.repo.owner,
+                repo: context.repo.repo
+              });
+
+              const existingRelease = releases.data.find(r => r.tag_name === '${{ steps.release_info.outputs.tag }}');
+
+              if (existingRelease) {
+                await github.rest.repos.deleteRelease({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  release_id: existingRelease.id
+                });
+
+                try {
+                  await github.rest.git.deleteRef({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    ref: 'tags/' + '${{ steps.release_info.outputs.tag }}'
+                  });
+                } catch (e) {}
+              }
+            } catch (e) {}
+
+      - name: Generate Release Body
+        id: generate_release_body
+        run: |
+          FEATURES_LIST=()
+          if [[ "${{ github.event.inputs.features }}" == *disable_signature_verification* ]]; then
+            FEATURES_LIST+=("- Signature Verification Bypass")
+          fi
+          if [[ "${{ github.event.inputs.features }}" == *disable_secure_flag* ]]; then
+            FEATURES_LIST+=("- Disable Secure Flag")
+          fi
+          if [[ "${{ github.event.inputs.features }}" == *kaorios_toolbox* ]]; then
+            FEATURES_LIST+=("- Kaorios Toolbox (Play Integrity Fix) ")
+          fi
+
+          if [ ${#FEATURES_LIST[@]} -eq 0 ]; then
+            FEATURES="- Signature Verification Bypass (default)"
+          else
+            FEATURES=$(printf '%s\n' "${FEATURES_LIST[@]}")
+          fi
+          
+          cat > /tmp/release_body.md << RELEASE_EOF
+          Android 16 Framework Patcher for ${{ github.event.inputs.device_name }}
+          
+          Device: ${{ github.event.inputs.device_name }}
+          Version: ${{ github.event.inputs.version_name }}
+          Android API: ${{ github.event.inputs.api_level }}
+          
+          Important: This module is built specifically for ${{ github.event.inputs.device_name }} running ${{ github.event.inputs.version_name }}. Installing on other devices or ROM versions may cause boot loops or system issues.
+          
+          Compatible with Magisk, KernelSU, and SUFS
+          
+          Features:
+          FEATURES_PLACEHOLDER
+          
+          Source files:
+          - Framework: ${{ github.event.inputs.framework_url }}
+          - Services: ${{ github.event.inputs.services_url }}
+          
+          Built: $(date +'%Y-%m-%d %H:%M:%S UTC')
+          Workflow: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          Changelog: https://github.com/${{ github.repository }}/blob/master/CHANGELOG.md
+          RELEASE_EOF
+          
+          echo "$FEATURES" > /tmp/features.txt
+          awk '{
+            if ($0 ~ /FEATURES_PLACEHOLDER/) {
+              while ((getline line < "/tmp/features.txt") > 0) print line
+              close("/tmp/features.txt")
+            } else {
+              print $0
+            }
+          }' /tmp/release_body.md > /tmp/release_body_final.md
+          mv /tmp/release_body_final.md /tmp/release_body.md
+          
+          echo "release_body<<EOF" >> $GITHUB_OUTPUT
+          cat /tmp/release_body.md >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        id: create_release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.release_info.outputs.tag }}
+          name: ${{ steps.release_info.outputs.name }}
+          files: |
+            ${{ steps.find_zip.outputs.file_path }}
+            build-manifest.json
+          body: |
+            ${{ steps.generate_release_body.outputs.release_body }}
+
+      - name: Upload patched jars
+        uses: actions/upload-artifact@v4
+        with:
+          name: android16-patched-jars-${{ github.run_id }}
+          if-no-files-found: warn
+          path: |
+            framework_patched.jar
+            services_patched.jar
+          retention-days: 7
+
+      - name: Upload module zip
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android16-module-${{ github.run_id }}
+          if-no-files-found: warn
+          path: Framework-Patcher-${{ steps.set_codename.outputs.codename }}*.zip
+          retention-days: 7
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android16-build-log-${{ github.run_id }}
+          if-no-files-found: warn
+          path: build_log_android16.txt
+          retention-days: 7
+
+      - name: Upload build manifest
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-manifest-${{ github.run_id }}
+          if-no-files-found: warn
+          path: build-manifest.json
+          retention-days: 30
+
+      - name: Send Telegram Notification (Success)
+        if: success() && github.event.inputs.user_id != ''
+        run: |
+          escape_mdv2() {
+            echo "$1" | sed -e 's/\\/\\\\/g' -e 's/\./\\./g' -e 's/\-/\\-/g' -e 's/!/\\!/g' -e 's/#/\\#/g' -e 's/{/\\{/g' -e 's/}/\\}/g' -e 's/(/\\(/g' -e 's/)/\\)/g'
+          }
+
+          DEVICE_CODENAME_ESCAPED=$(escape_mdv2 "${{ steps.set_codename.outputs.codename }}")
+          DEVICE_NAME_ESCAPED=$(escape_mdv2 "${{ github.event.inputs.device_name }}")
+          VERSION_NAME_ESCAPED=$(escape_mdv2 "${{ github.event.inputs.version_name }}")
+          API_LEVEL_ESCAPED=$(escape_mdv2 "${{ github.event.inputs.api_level }}")
+
+          MESSAGE=$(printf "Android 16 framework patch is ready for your device:\n\n> *Device:* \`%s\`\n> *Codename:* \`%s\`\n> *Version:* \`%s\`\n> *Android API:* \`%s\`\n\nModule compatible with Magisk, KSU, and SUFS" \
+            "$DEVICE_NAME_ESCAPED" \
+            "$DEVICE_CODENAME_ESCAPED" \
+            "$VERSION_NAME_ESCAPED" \
+            "$API_LEVEL_ESCAPED")
+          
+          RELEASE_URL="https://github.com/${{ github.repository }}/releases/tag/${{ steps.release_info.outputs.tag }}"
+          
+          REPLY_MARKUP="{\"inline_keyboard\":[[{\"text\":\"Click here to download\",\"url\":\"$RELEASE_URL\"}],[{\"text\":\"Support me\",\"url\":\"https://buymeacoffee.com/jefino\"}]]}"
+
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id=${{ github.event.inputs.user_id }} \
+            -d text="$MESSAGE" \
+            -d parse_mode="MarkdownV2" \
+            -d reply_markup="$REPLY_MARKUP"
+
+      - name: Send Telegram Notification (Failure)
+        if: failure() && github.event.inputs.user_id != ''
+        run: |
+          escape_mdv2() {
+            echo "$1" | sed -e 's/\\/\\\\/g' -e 's/\./\\./g' -e 's/\-/\\-/g' -e 's/!/\\!/g' -e 's/#/\\#/g' -e 's/{/\\{/g' -e 's/}/\\}/g' -e 's/(/\\(/g' -e 's/)/\\)/g'
+          }
+
+          DEVICE_CODENAME="${{ steps.set_codename.outputs.codename }}"
+          if [ -z "$DEVICE_CODENAME" ]; then
+            DEVICE_CODENAME="${{ github.event.inputs.device_codename }}"
+          fi
+
+          DEVICE_CODENAME_ESCAPED=$(escape_mdv2 "$DEVICE_CODENAME")
+          DEVICE_NAME_ESCAPED=$(escape_mdv2 "${{ github.event.inputs.device_name }}")
+          VERSION_NAME_ESCAPED=$(escape_mdv2 "${{ github.event.inputs.version_name }}")
+          WORKFLOW_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          MESSAGE=$(printf "Android 16 framework patch failed for your device:\n\n> *Device:* \`%s\`\n> *Codename:* \`%s\`\n> *Version:* \`%s\`\n\nCheckout logs below\." \
+            "$DEVICE_NAME_ESCAPED" \
+            "$DEVICE_CODENAME_ESCAPED" \
+            "$VERSION_NAME_ESCAPED")
+
+          REPLY_MARKUP="{\"inline_keyboard\":[[{\"text\":\"View Workflow Run\",\"url\":\"$WORKFLOW_URL\"}]]}"
+
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id=${{ github.event.inputs.user_id }} \
+            -d text="$MESSAGE" \
+            -d parse_mode="MarkdownV2" \
+            -d reply_markup="$REPLY_MARKUP"
+
+          LOG_FILE="build_log_android16.txt"
+          if [ ! -s "$LOG_FILE" ]; then
+            LOG_FILE="failure_summary_android16.txt"
+            {
+              echo "Build log file was not generated."
+              echo "Device: ${{ github.event.inputs.device_name }}"
+              echo "Codename: $DEVICE_CODENAME"
+              echo "Version: ${{ github.event.inputs.version_name }}"
+              echo "Workflow run: $WORKFLOW_URL"
+              echo "Please open the workflow URL for full runner logs."
+            } > "$LOG_FILE"
+          fi
+
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendDocument" \
+            -F chat_id="${{ github.event.inputs.user_id }}" \
+            -F document=@"$LOG_FILE" \
+            -F caption="Android 16 failure log"
